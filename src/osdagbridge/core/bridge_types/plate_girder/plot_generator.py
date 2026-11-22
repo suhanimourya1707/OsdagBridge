@@ -1552,6 +1552,181 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
     return fig, summary_data
 
 
+# =============================================================================
+# TRANSVERSE MEMBERS (end diaphragms + intermediate cross bracings)
+# =============================================================================
+
+def build_figure_transverse(ds, plot_key, nodes, members, edge_dist=0.0, eng_scale=1.0):
+    """
+    3-D diagram of a force or displacement component along every transverse
+    member line (end diaphragms and intermediate cross bracings).
+
+    All data comes from results_data: the member mapping
+    (build_transverse_member_lines) and the values for the selected load case
+    (extract_transverse_member_results).
+
+    Returns
+    -------
+    fig          : matplotlib.figure.Figure
+    summary_data : {"End Diaphragms": {"max", "min"}, "Cross Bracings": {"max", "min"}}
+    """
+    from .results_data import (
+        member_groups_from_dataset,
+        build_transverse_member_lines,
+        extract_transverse_member_results,
+        TRANSVERSE_KIND_END_DIAPHRAGM,
+    )
+
+    v_scale = _value_plot_scale(eng_scale)
+    is_disp = plot_key in DISP_MAP
+    is_shear = plot_key.startswith("F")
+    unit = "mm" if is_disp else ("kNm" if plot_key.startswith("M") else "kN")
+    label = DISP_DISPLAY.get(plot_key, plot_key) if is_disp else FORCE_DISPLAY.get(plot_key, plot_key)
+
+    groups = member_groups_from_dataset(ds)
+    lines = build_transverse_member_lines(nodes, members, groups, edge_dist=edge_dist)
+    results = extract_transverse_member_results(ds, lines, nodes, members, plot_key)
+
+    fig = Figure(figsize=(14, 6), dpi=110, facecolor="white")
+    ax = fig.add_subplot(111, projection="3d", facecolor="white")
+
+    all_xs = [c[0] for c in nodes.values()]
+    all_zs = [c[2] for c in nodes.values()]
+    x_min, x_max = min(all_xs), max(all_xs)
+    z_min, z_max = min(all_zs), max(all_zs)
+    x_range = (x_max - x_min) or 1.0
+    z_range = (z_max - z_min) or 1.0
+    x_pad = x_range * 0.05
+    z_pad = z_range * 0.05
+    ax.set_xlim(x_min - x_pad, x_max + x_pad)
+    ax.set_ylim(z_min - z_pad, z_max + z_pad)
+
+    # Girders as faint context, transverse members highlighted on the base plane
+    _add_grillage_background(
+        ax, nodes, members,
+        show_transverse=False,
+        include_edge_longitudinals=False,
+        include_end_transverse=False,
+        show_inner_nodes=False,
+    )
+
+    styles = {
+        TRANSVERSE_KIND_END_DIAPHRAGM: dict(line="#E65100", fill="#FFCC80", name="End Diaphragms"),
+        "cross_bracing":               dict(line="#00695C", fill="#80CBC4", name="Cross Bracings"),
+    }
+
+    summary_data = {}
+    _scatter_objs, _scatter_data = [], {}
+    global_vmin = global_vmax = 0.0
+    extreme = {"max": None, "min": None}   # (value, x, z, v_geom)
+
+    for res in results:
+        st = styles.get(res["kind"], styles["cross_bracing"])
+        xs = np.asarray(res["xs"], dtype=float)
+        zs = np.asarray(res["zs"], dtype=float)
+        vals = np.asarray(res["values"], dtype=float)
+        v_geom = vals * v_scale
+        if v_geom.size:
+            global_vmin = min(global_vmin, float(v_geom.min()))
+            global_vmax = max(global_vmax, float(v_geom.max()))
+
+        # member on the base plane
+        ax.plot(xs, zs, np.zeros_like(xs), color=st["line"], linewidth=1.4, alpha=0.6, zorder=3)
+
+        # Shear / axial force is constant along an element -> stepped diagram
+        # (same as the longitudinal SFD); moments and deflections -> polyline.
+        if is_shear and len(xs) > 1:
+            px = np.repeat(xs, 2)[1:-1]
+            pz = np.repeat(zs, 2)[1:-1]
+            pv = np.repeat(v_geom[:-1], 2)
+        else:
+            px, pz, pv = xs, zs, v_geom
+
+        # diagram + fill down to the member
+        ax.plot_surface(
+            np.vstack([px, px]), np.vstack([pz, pz]),
+            np.vstack([np.zeros_like(pv), pv]),
+            color=st["fill"], alpha=0.30, linewidth=0, antialiased=False, zorder=2,
+        )
+        ax.plot(px, pz, pv, color=st["line"], linewidth=2.0, zorder=4)
+        for xi, zi, vi in zip(xs, zs, v_geom):
+            ax.plot([xi, xi], [zi, zi], [0, vi], color=st["line"], linewidth=0.8, alpha=0.5, zorder=3)
+
+        sc = ax.scatter(xs, zs, v_geom, color=st["line"], s=18, zorder=5, depthshade=False)
+        _scatter_objs.append(sc)
+        _scatter_data[id(sc)] = (res["nodes"], xs, vals, res["kind"])
+
+        for j, (xi, zi, vi, vg) in enumerate(zip(xs, zs, vals, v_geom)):
+            if abs(vi) > 1e-4:
+                ax.text(xi, zi, vg, f" {vi:.2f}", color="#455A64", fontsize=6,
+                        ha="left", va="bottom" if j % 2 == 0 else "top",
+                        zorder=6, gid="all_vals")
+
+        if vals.size:
+            entry = summary_data.setdefault(st["name"], {"max": float(vals.max()), "min": float(vals.min())})
+            entry["max"] = max(entry["max"], float(vals.max()))
+            entry["min"] = min(entry["min"], float(vals.min()))
+            i_max, i_min = int(vals.argmax()), int(vals.argmin())
+            if extreme["max"] is None or vals[i_max] > extreme["max"][0]:
+                extreme["max"] = (vals[i_max], xs[i_max], zs[i_max], v_geom[i_max])
+            if extreme["min"] is None or vals[i_min] < extreme["min"][0]:
+                extreme["min"] = (vals[i_min], xs[i_min], zs[i_min], v_geom[i_min])
+
+    # Global extremes, styled like the longitudinal diagrams
+    for tag, va in (("max", "bottom"), ("min", "top")):
+        if extreme[tag] is None:
+            continue
+        val, xe, ze, vg = extreme[tag]
+        ax.plot([xe], [ze], [vg], marker="o", markersize=9, color="black",
+                markeredgecolor="white", markeredgewidth=1.5, linestyle="None",
+                zorder=10, gid=f"{tag}_line")
+        ax.text(xe, ze, vg, f" {val:.3f} {unit}", color="black", fontsize=7, fontweight="bold",
+                ha="left", va=va, zorder=11, gid=f"{tag}_line",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8, edgecolor="none"))
+
+    if _MPLCURSORS and _scatter_objs:
+        cursor = mplcursors.cursor(_scatter_objs, hover=True)
+        fig._custom_cursor = cursor
+
+        @cursor.connect("add")
+        def _on_add(sel, _data=_scatter_data, _lbl=label, _u=unit):
+            nids, xs_l, vals_l, kind = _data[id(sel.artist)]
+            idx = sel.index
+            kind_txt = "End diaphragm" if kind == TRANSVERSE_KIND_END_DIAPHRAGM else "Cross bracing"
+            sel.annotation.set_text(
+                f"{kind_txt}\nNode {nids[idx]}\nX: {xs_l[idx]:.2f} m\n{_lbl}: {vals_l[idx]:.3f} {_u}"
+            )
+            sel.annotation.get_bbox_patch().set(fc="white", alpha=0.9, edgecolor="#BBBBBB")
+
+    _add_supports(ax, nodes, members, edge_dist=edge_dist)
+    _add_node_number_labels(ax, nodes)
+    _add_element_number_labels(ax, nodes, members)
+    ax.set_xlabel("Span Length (m)", fontsize=10, labelpad=8)
+    ax.set_ylabel("Bridge Width (m)", fontsize=10, labelpad=8)
+    ax.set_zlabel(f"{label} ({unit})", fontsize=10, labelpad=8)
+    _set_value_axis_tick_formatter(ax, v_scale)
+
+    zlo, zhi = min(0.0, global_vmin), max(0.0, global_vmax)
+    pad = max(1e-6, 0.05 * max(1e-9, zhi - zlo))
+    ax.set_zlim(zlo - pad, zhi + pad)
+    ax.set_box_aspect([x_range, z_range, (x_range * 0.30) * max(v_scale, 1e-6)])
+    kind_name = "Displacement" if is_disp else "Internal Force"
+    ax.set_title(f"Transverse Members {kind_name}  —  {label} ({unit})",
+                 fontsize=12, fontweight="bold", pad=12)
+    fig._eng_scale = v_scale
+    ax.view_init(elev=DEFAULT_ELEV + 15, azim=DEFAULT_AZIM + 25)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.pane.fill = False
+    _add_coordinate_triad(ax, nodes, eng_scale=v_scale)
+    ax.set_axis_off()
+
+    if not results:
+        ax.text2D(0.5, 0.5, "No transverse members found in the analysis model",
+                  transform=ax.transAxes, ha="center", va="center", fontsize=11, color="#555555")
+
+    return fig, summary_data
+
+
 def figure_to_bytes(fig, fmt="png", dpi=150):
     """Convenience helper — render a matplotlib figure to raw bytes."""
     buf = io.BytesIO()

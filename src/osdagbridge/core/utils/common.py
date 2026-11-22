@@ -132,6 +132,8 @@ KEY_SECTION_OUTPUT_STEELDESIGN = "section.output.superstructure.steeldesign"
 
 # ── Output field keys ─────────────────────────────────────────────────────────
 KEY_ANALYSIS_MEMBER           = "analysis.member"
+# Option of the analysis Member dropdown that plots all transverse members
+VALUE_ANALYSIS_MEMBER_TRANSVERSE = "Transverse Members"
 KEY_ANALYSIS_LOAD_COMBINATION = "analysis.load_combination"
 KEY_ANALYSIS_FORCES           = "analysis.forces"
 KEY_ANALYSIS_DISPLAY_OPTIONS  = "analysis.display_options"
@@ -472,6 +474,14 @@ KEY_WC_LD_LANE_TABLE = "typical_section.lane_details.lane_table"
 KEY_WC_LD_LANE_TABLE_COUNT = "typical_section.lane_details.lane_table_count"
 
 #══════════════TYPICAL-SECTION-TAB-KEY-ENDS═══════════════════════════════════════════════════════
+
+# ── Additional Inputs: widget naming used by the pre-save "Custom" validation ──
+# Mode+value fields (TYPE_MODE_LINE) are built as "<key>.mode" (combo) and
+# "<key>.value" (line edit); every field label is named "<key>_label".
+VALUE_CUSTOM      = "Custom"
+KEY_SUFFIX_MODE   = ".mode"
+KEY_SUFFIX_VALUE  = ".value"
+KEY_SUFFIX_LABEL  = "_label"
 
 #══════════════MEMBER-PROPERTIES-TAB-KEY-STARTS═══════════════════════════════════════════════════════
 KEY_MEMBER_PROPERTIES_TAB           = "member_properties"

@@ -94,6 +94,308 @@ def _build_nodes_members() -> tuple[dict, dict]:
     return nodes, members
 
 
+# =============================================================================
+# LONGITUDINAL / TRANSVERSE MEMBER MAPPING
+# =============================================================================
+#
+# ospgrillage names every element group it creates. These names are the most
+# reliable way to tell the two families apart; geometry is only a fallback for
+# results that carry no group information.
+#
+#   longitudinal : edge_beam, exterior_main_beam_1/2, interior_main_beam
+#   transverse   : start_edge / end_edge   -> end diaphragms (support lines)
+#                  transverse_slab         -> intermediate transverse members
+#                                             (cross bracings between girders)
+
+LONGITUDINAL_GROUPS = (
+    "edge_beam", "exterior_main_beam_1", "exterior_main_beam_2", "interior_main_beam",
+)
+MAIN_GIRDER_GROUPS = ("exterior_main_beam_1", "exterior_main_beam_2", "interior_main_beam")
+END_DIAPHRAGM_GROUPS = ("start_edge", "end_edge")
+TRANSVERSE_GROUPS = END_DIAPHRAGM_GROUPS + ("transverse_slab",)
+
+TRANSVERSE_KIND_END_DIAPHRAGM = "end_diaphragm"
+TRANSVERSE_KIND_CROSS_BRACING = "cross_bracing"
+
+# Plot keys -> (i-end, j-end) element force components
+TRANSVERSE_FORCE_COMPONENTS = {
+    "Fx": ("Vx_i", "Vx_j"), "Fy": ("Vy_i", "Vy_j"), "Fz": ("Vz_i", "Vz_j"),
+    "Mx": ("Mx_i", "Mx_j"), "My": ("My_i", "My_j"), "Mz": ("Mz_i", "Mz_j"),
+}
+# Plot keys -> static nodal displacement component in ds["displacements"]
+TRANSVERSE_DISP_COMPONENTS = {"Dx": "x", "Dy": "y", "Dz": "z"}
+
+
+def _flatten_tags(value) -> list[int]:
+    """Flatten nested element lists ([[1, 2], [3]] or [1, 2, 3]) to ints."""
+    if isinstance(value, dict):
+        value = value.get("elements", [])
+    out: list[int] = []
+    for item in value or []:
+        if isinstance(item, (list, tuple)):
+            out.extend(_flatten_tags(item))
+        else:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def member_groups_from_dataset(ds) -> dict[str, list[int]]:
+    """
+    Read the ospgrillage element groups stored on the results dataset
+    (``ds.attrs["member_elements"]``). Returns {} when they are not available.
+    """
+    raw = getattr(ds, "attrs", {}).get("member_elements") if ds is not None else None
+    if not raw:
+        return {}
+    try:
+        groups = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (TypeError, ValueError):
+        return {}
+    return {name: _flatten_tags(value) for name, value in groups.items()}
+
+
+def classify_member_tags(nodes: dict, members: dict, groups: dict | None = None) -> dict:
+    """
+    Split element tags into longitudinal and transverse members.
+
+    Parameters
+    ----------
+    nodes   : {node_tag: [x, y, z]}
+    members : {element_tag: [n_i, n_j]}
+    groups  : ospgrillage groups ({group_name: [element tags]}), e.g. from
+              ``member_groups_from_dataset(ds)`` or ``model.get_element``.
+
+    Returns
+    -------
+    {
+        "longitudinal":  [tags],   # girders + edge beams
+        "main_girder":   [tags],   # girders only (no edge beams)
+        "transverse":    [tags],   # every transverse element
+        "end_diaphragm": [tags],   # transverse elements on the support lines
+    }
+
+    With groups, membership is taken from ospgrillage directly. Without them
+    an element is transverse when its lateral (Z) extent is larger than its
+    span-wise (X) extent, which also holds for skewed decks where transverse
+    elements are not parallel to the Z axis.
+    """
+    member_tags = {int(t) for t in members}
+    groups = {k: [t for t in v if t in member_tags] for k, v in (groups or {}).items()}
+
+    if any(groups.get(g) for g in TRANSVERSE_GROUPS) and any(groups.get(g) for g in LONGITUDINAL_GROUPS):
+        longitudinal = sorted({t for g in LONGITUDINAL_GROUPS for t in groups.get(g, [])})
+        main_girder = sorted({t for g in MAIN_GIRDER_GROUPS for t in groups.get(g, [])})
+        transverse = sorted({t for g in TRANSVERSE_GROUPS for t in groups.get(g, [])})
+        end_diaphragm = sorted({t for g in END_DIAPHRAGM_GROUPS for t in groups.get(g, [])})
+        return {
+            "longitudinal": longitudinal,
+            "main_girder": main_girder or longitudinal,
+            "transverse": transverse,
+            "end_diaphragm": end_diaphragm,
+        }
+
+    # ── Geometry fallback ──────────────────────────────────────────────────
+    longitudinal, transverse = [], []
+    for tag, (n1, n2) in members.items():
+        if n1 not in nodes or n2 not in nodes:
+            continue
+        x1, _, z1 = nodes[n1]
+        x2, _, z2 = nodes[n2]
+        if abs(z2 - z1) > abs(x2 - x1):
+            transverse.append(int(tag))
+        else:
+            longitudinal.append(int(tag))
+
+    # End diaphragms: transverse elements lying on the first / last support line
+    # (for a skewed deck those lines are the transverse lines with the smallest /
+    # largest mid-point X).
+    end_diaphragm = []
+    if transverse:
+        def _mid_x(tag):
+            n1, n2 = members[tag]
+            return (nodes[n1][0] + nodes[n2][0]) / 2.0
+
+        lines = _chain_elements(transverse, members)
+        if lines:
+            mids = [sum(_mid_x(t) for t in line) / len(line) for line in lines]
+            for idx in (mids.index(min(mids)), mids.index(max(mids))):
+                end_diaphragm.extend(lines[idx])
+
+    return {
+        "longitudinal": sorted(longitudinal),
+        "main_girder": sorted(longitudinal),
+        "transverse": sorted(transverse),
+        "end_diaphragm": sorted(set(end_diaphragm)),
+    }
+
+
+def _chain_elements(tags: list, members: dict) -> list[list[int]]:
+    """Group element tags into connected chains (elements sharing a node)."""
+    parent = {t: t for t in tags}
+
+    def find(t):
+        while parent[t] != t:
+            parent[t] = parent[parent[t]]
+            t = parent[t]
+        return t
+
+    node_owner: dict = {}
+    for t in tags:
+        for n in members[t]:
+            if n in node_owner:
+                parent[find(t)] = find(node_owner[n])
+            else:
+                node_owner[n] = t
+
+    chains: dict = {}
+    for t in tags:
+        chains.setdefault(find(t), []).append(t)
+    return list(chains.values())
+
+
+def build_transverse_member_lines(nodes: dict, members: dict, groups: dict | None = None,
+                                  edge_dist: float = 0.0) -> list[dict]:
+    """
+    Group the transverse elements into cross-section lines, keeping only the
+    elements that span between two girders (the overhang pieces that connect a
+    girder to an edge beam are slab, not bracing).
+
+    Returns a list sorted along the span::
+
+        [{
+            "kind":     "end_diaphragm" | "cross_bracing",
+            "x":        mean X of the line (m),
+            "elements": [tags ordered across the width],
+            "nodes":    [node tags ordered across the width],
+        }, ...]
+    """
+    cls = classify_member_tags(nodes, members, groups)
+
+    # Nodes that sit on a girder line
+    girder_tags = cls["main_girder"]
+    if not groups and edge_dist > 0:
+        # Geometry fallback: drop the two outermost longitudinal lines (edge beams)
+        by_z: dict = {}
+        for t in girder_tags:
+            n1, _ = members[t]
+            by_z.setdefault(round(nodes[n1][2], 3), []).append(t)
+        if len(by_z) > 2:
+            zs = sorted(by_z)
+            girder_tags = [t for z in zs[1:-1] for t in by_z[z]]
+    girder_nodes = {n for t in girder_tags for n in members[t]}
+
+    end_set = set(cls["end_diaphragm"])
+    between_girders = [
+        t for t in cls["transverse"]
+        if members[t][0] in girder_nodes and members[t][1] in girder_nodes
+    ]
+
+    lines = []
+    for chain in _chain_elements(between_girders, members):
+        # Order elements and nodes across the width (by Z of the element mid-point)
+        chain.sort(key=lambda t: (nodes[members[t][0]][2] + nodes[members[t][1]][2]) / 2.0)
+        node_path = []
+        for t in chain:
+            n_a, n_b = members[t]
+            first, second = (n_a, n_b) if nodes[n_a][2] <= nodes[n_b][2] else (n_b, n_a)
+            if not node_path:
+                node_path.append(first)
+            node_path.append(second)
+        mean_x = sum(nodes[n][0] for n in node_path) / len(node_path)
+        kind = (TRANSVERSE_KIND_END_DIAPHRAGM if any(t in end_set for t in chain)
+                else TRANSVERSE_KIND_CROSS_BRACING)
+        lines.append({"kind": kind, "x": mean_x, "elements": chain, "nodes": node_path})
+
+    lines.sort(key=lambda line: line["x"])
+    return lines
+
+
+def extract_transverse_member_results(ds, lines: list, nodes: dict, members: dict,
+                                      plot_key: str) -> list[dict]:
+    """
+    Pull the internal force or displacement along every transverse line for
+    one load case (``ds`` is already ``ds_all.sel(Loadcase=...)``).
+
+    plot_key : "Fx" "Fy" "Fz" "Mx" "My" "Mz"  -> element forces, kN / kNm
+               "Dx" "Dy" "Dz"                   -> nodal displacement, mm
+
+    Each returned line dict is the input line plus
+        "xs", "zs" : node coordinates across the width
+        "values"   : value at each node (same length as "nodes")
+
+    Forces: each node takes the i-end value of the element that starts there
+    (the convention of the longitudinal diagrams in plot_generator); the last
+    node takes the j-end value with its sign flipped, because element end
+    forces at the j-end act in the opposite sense. With this, a symmetric
+    load gives a symmetric moment diagram across the deck.
+    Displacements: vertical/lateral values are flipped so sag is positive.
+    """
+    out = []
+    if plot_key in TRANSVERSE_DISP_COMPONENTS:
+        comp = _match_component(ds["displacements"], TRANSVERSE_DISP_COMPONENTS[plot_key])
+        flip = -1.0 if comp is not None and comp.lower() in ("y", "z") else 1.0
+        for line in lines:
+            vals = []
+            for n in line["nodes"]:
+                v = 0.0
+                if comp is not None:
+                    v = _as_float(ds["displacements"].sel(Node=n, Component=comp).values)
+                vals.append(round(flip * v * 1000.0, 4))   # m -> mm
+            out.append(_with_coords(line, nodes, vals))
+        return out
+
+    comp_i_name, comp_j_name = TRANSVERSE_FORCE_COMPONENTS[plot_key]
+    comp_i = _match_component(ds["forces"], comp_i_name)
+    comp_j = _match_component(ds["forces"], comp_j_name)
+    for line in lines:
+        vals = []
+        for k, t in enumerate(line["elements"]):
+            n_first = line["nodes"][k]
+            # Element may be stored j->i relative to the left-to-right path
+            reversed_elem = members[t][0] != n_first
+            start_comp = comp_j if reversed_elem else comp_i
+            vals.append(_force_kn(ds, t, start_comp))
+        last = line["elements"][-1]
+        reversed_last = members[last][0] != line["nodes"][-2]
+        end_comp = comp_i if reversed_last else comp_j
+        v_end = _force_kn(ds, last, end_comp)
+        vals.append(-v_end)
+        out.append(_with_coords(line, nodes, [round(v, 3) for v in vals]))
+    return out
+
+
+def _match_component(data_array, name: str):
+    for c in data_array.coords["Component"].values:
+        if str(c).lower() == name.lower():
+            return str(c)
+    return None
+
+
+def _as_float(value) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if v != v else v   # NaN -> 0
+
+
+def _force_kn(ds, element: int, comp) -> float:
+    if comp is None:
+        return 0.0
+    return _as_float(ds["forces"].sel(Element=element, Component=comp).values) / 1000.0  # N -> kN
+
+
+def _with_coords(line: dict, nodes: dict, values: list) -> dict:
+    result = dict(line)
+    result["xs"] = [nodes[n][0] for n in line["nodes"]]
+    result["zs"] = [nodes[n][2] for n in line["nodes"]]
+    result["values"] = [v + 0.0 for v in values]   # normalise -0.0 to 0.0
+    return result
+
+
 def dump_full_data(
     model,
     edge_dist: float = 0.0,
@@ -408,18 +710,13 @@ def _build_full_data(model, edge_dist: float = 0.0, dataset=None, lazy: bool = F
     disp_components = [str(
         c) for c in ds0["displacements"].coords["Component"].values] if "displacements" in ds0.data_vars else []
 
-    # Classify members: longitudinal = both nodes share same Z and same Y
-    _z_tol = 1e-3
-    longitudinal_members = []
-    transverse_members = []
-    for tag, (n1, n2) in members.items():
-        if n1 not in nodes or n2 not in nodes:
-            continue
-        if (abs(nodes[n1][2] - nodes[n2][2]) < _z_tol and
-                abs(nodes[n1][1] - nodes[n2][1]) < _z_tol):
-            longitudinal_members.append(tag)
-        else:
-            transverse_members.append(tag)
+    # Classify members from the ospgrillage groups (geometry only as fallback,
+    # see classify_member_tags). The old "same Z and same Y" test put every
+    # transverse element of a skewed deck in the right list only by accident
+    # and could not tell end diaphragms from intermediate members.
+    _classes = classify_member_tags(nodes, members, groups)
+    longitudinal_members = _classes["longitudinal"]
+    transverse_members = _classes["transverse"]
 
     data: dict = {
         "nodes": {str(k): list(v) for k, v in nodes.items()},

@@ -787,7 +787,74 @@ class CustomWindow(QWidget):
         # Connect to input dock's value changed signals
         # This will update the CAD whenever any input field changes
         if hasattr(self.input_dock, 'input_value_changed'):
-            self.input_dock.input_value_changed.connect(self.update_cad_from_inputs)        
+            self.input_dock.input_value_changed.connect(self.update_cad_from_inputs)
+
+        # Values typed directly into the 2D CAD dimension labels (double-click)
+        self.cad_comp_widget.cad_value_edited.connect(self._on_cad_value_edited)
+
+    # Fields edited from the CAD that live in the Basic Inputs dock; every
+    # other editable CAD field lives in the Additional Inputs dialog.
+    _CAD_BASIC_INPUT_KEYS = (KEY_SPAN, KEY_CARRIAGEWAY_WIDTH)
+
+    def _on_cad_value_edited(self, key: str, value_text: str):
+        """
+        A value was typed into a 2D CAD dimension label.
+
+        The value goes through the same path as typing it into the input form,
+        so the same validation (popup + auto-correction) is applied:
+          * Span / Carriageway Width   -> Basic Inputs dock
+          * Girder Spacing / Deck Thk. -> Additional Inputs dictionary
+        After the dictionaries are updated the 2D CAD is redrawn.
+        """
+        if self.input_dock is not None and self.input_dock.is_locked:
+            CustomMessageBox(
+                title="Inputs Locked",
+                text="Inputs are locked after design. Unlock the inputs to edit values from the CAD.",
+                dialogType=MessageBoxType.Warning,
+            ).exec()
+            return
+
+        if key in self._CAD_BASIC_INPUT_KEYS:
+            self._apply_cad_edit_to_basic_inputs(key, value_text)
+        else:
+            self._apply_cad_edit_to_additional_inputs(key, value_text)
+
+    def _apply_cad_edit_to_basic_inputs(self, key: str, value_text: str):
+        if self.input_dock is None:
+            return
+        widget = self.input_dock.input_widget.findChild(QLineEdit, key)
+        if widget is None:
+            return
+        widget.blockSignals(True)
+        widget.setText(value_text)
+        widget.blockSignals(False)
+        # Validates, writes input_dict and emits input_value_changed -> CAD redraw
+        self.input_dock._on_field_edited(key, widget)
+
+    def _apply_cad_edit_to_additional_inputs(self, key: str, value_text: str):
+        dlg = self._get_additional_inputs()
+        # Make sure the dialog works on the current state before editing it
+        dlg.set_input_dictionary(self.input_dict)
+
+        widget = dlg.findChild(QLineEdit, key)
+        if widget is None:
+            return
+        widget.blockSignals(True)
+        widget.setText(value_text)
+        widget.blockSignals(False)
+        # Same hard validation as typing in the dialog (popup + corrected value)
+        dlg._on_field_edited(key, widget)
+
+        # Girder spacing is linked to overhang / no. of girders / overall width:
+        # re-solve the layout exactly like the dialog does on editingFinished.
+        if key == KEY_TS_GIRDER_SPACING:
+            dlg.update_girder_layout("spacing")
+
+        # Commit (same as pressing Save in Additional Inputs) and redraw
+        self.input_dict.update(dlg.working_input_dict)
+        dlg.is_modified = False
+        dlg._update_additional_input_cad()
+        self.cad_comp_widget.update_from_osdag_inputs(self.input_dict)
             
     # Function for saving input dictionary into an OSI file
     def saveOSI_inputs(self):
